@@ -29,6 +29,7 @@ public:
   int8_t  width();
   int8_t  height();
   uint8_t *getBuffer(void);
+  void sendBuffer(uint8_t *buffer);
 
 private:
   void icm2_command1(uint8_t c); // Sends a sequence of Wire commands

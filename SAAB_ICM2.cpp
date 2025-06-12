@@ -290,3 +290,58 @@ void SAAB_ICM2::display(void)
     }
 }
 
+void SAAB_ICM2::sendBuffer(uint8_t *buffer) {
+    //does NOT work as intended, janky dirty function has issue with bottom pixel row that is known to be strange.
+
+    // The display is split into 9 rows of 8 pixels high, each column represented by a byte.
+    // What is weird is that the first line pixels (1-pixel high), is actually found in the 9th row as the MSB. 
+    // In this sense, the first line of the display is "at the bottom" of the address space in memory.
+
+    // DRAW FIRST PIXEL ROW (top row of pixels).
+    uint8_t *ptr0 = buffer;
+    
+    // Start at row addr 0x48 (9th row in address space)
+    uint8_t lineAddr = 0x40 + 8;
+    uint8_t dat[3] = {0x00, 0x01, lineAddr};
+    
+    icm2_commandList(dat, sizeof(dat));
+    icm2_commandList((const uint8_t[]){0x00, 0x01, 0x20}, 3);
+    icm2_commandList((const uint8_t[]){0x00, 0x01, 0x8d}, 3);
+    
+    uint16_t count = _width;
+
+    Wire.beginTransmission(i2caddr);
+    Wire.write((uint8_t)0x40);
+    
+    while (count--)
+    {
+        Wire.write(*ptr0++ & 0b10000000); // Only grab MSB. This isn't strictly neccesary as only the MSB is actually displayed.
+    }
+    Wire.endTransmission();
+
+    // Draw remaining rows, in groups of 8 pixel columns as mentioned.
+    // Reset pointer to beginning and draw the remaining 8 lines, this sort of "overlaps" the buffer for the first row, in a sense.
+    uint8_t *ptr = buffer;
+
+    for (int line = 0; line < 8; line++)
+    {
+        // Set address location in memory
+        uint8_t lineAddr = 0x40 + line;
+        uint8_t dat[3] = {0x00, 0x01, lineAddr};
+        icm2_commandList(dat, sizeof(dat));
+        icm2_commandList((const uint8_t[]){0x00, 0x01, 0x20}, 3);
+        icm2_commandList((const uint8_t[]){0x00, 0x01, 0x8d}, 3);
+
+        uint16_t count = _width;
+
+        Wire.beginTransmission(i2caddr);
+        Wire.write((uint8_t)0x40);
+
+        while (count--)
+        {
+            Wire.write(((*ptr & 127) << 1) | ((*(ptr + _width) & 0b10000000) >> 7));
+            ptr++;
+        }
+        Wire.endTransmission();
+    }
+}
