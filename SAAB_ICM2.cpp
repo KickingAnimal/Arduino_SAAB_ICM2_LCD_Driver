@@ -31,7 +31,7 @@
             Pointer to an existing TwoWire instance (e.g. &Wire, the
             microcontroller's primary I2C bus).
 */
-SAAB_ICM2::SAAB_ICM2() : Adafruit_GFX(_width, _height), buffer(NULL) {}
+SAAB_ICM2::SAAB_ICM2() : Adafruit_GFX(_width, _height), buffer(NULL), shadowBuffer(NULL) {}
 
 /*!
     @brief  Destructor for Adafruit_SSD1306 object.
@@ -43,9 +43,13 @@ SAAB_ICM2::~SAAB_ICM2(void)
         free(buffer);
         buffer = NULL;
     }
-}
 
-// INTERNAL FUNCTIONS
+    if (shadowBuffer)
+    {
+        free(shadowBuffer);
+        shadowBuffer = NULL;
+    }
+}
 
 void SAAB_ICM2::icm2_command1(uint8_t c)
 {
@@ -57,7 +61,6 @@ void SAAB_ICM2::icm2_command1(uint8_t c)
 
 void SAAB_ICM2::icm2_commandList(const uint8_t *c, uint8_t n)
 {
-
     Wire.beginTransmission(i2caddr);
     Wire.write(c, n);
     Wire.endTransmission();
@@ -89,25 +92,145 @@ int8_t SAAB_ICM2::height()
     return _height;
 }
 
-// ALLOCATE & INIT DISPLAY -------------------------------------------------
+void SAAB_ICM2::sendDisplayRow(const uint8_t *source, uint8_t row)
+{
+    if (!source)
+    {
+        return;
+    }
 
-/*!
-    @brief  Allocate RAM for image buffer, initialize peripherals and pins.
-    @param  addr
-            I2C address of corresponding ICM2 display.
-    @return true on successful allocation/init, false otherwise.
-            Well-behaved code should check the return value before
-            proceeding.
-    @note   MUST call this function before any drawing or updates!
-*/
+    uint8_t lineAddr = 0x40 + row;
+    uint8_t dat[3] = {0x00, 0x01, lineAddr};
+
+    icm2_commandList(dat, sizeof(dat));
+    icm2_commandList((const uint8_t[]){0x00, 0x01, 0x20}, 3);
+    icm2_commandList((const uint8_t[]){0x00, 0x01, 0x8d}, 3);
+
+    Wire.beginTransmission(i2caddr);
+    Wire.write((uint8_t)0x40);
+
+    if (row == 8)
+    {
+        const uint8_t *ptr = source;
+        for (int x = 0; x < _width; x++)
+        {
+            Wire.write(*ptr++ & 0b10000000);
+        }
+    }
+    else
+    {
+        const uint8_t *current = source + (row * _width);
+        const uint8_t *next = current + _width;
+
+        for (int x = 0; x < _width; x++)
+        {
+            Wire.write(((current[x] & 127) << 1) | ((next[x] & 0b10000000) >> 7));
+        }
+    }
+
+    Wire.endTransmission();
+}
+
+void SAAB_ICM2::flushIfDirty(const uint8_t *source)
+{
+    if (!source || !shadowBuffer)
+    {
+        return;
+    }
+
+    const size_t frameSize = _width * ((_height + 7) / 8);
+    bool dirtyRows[9] = {false, false, false, false, false, false, false, false, false};
+
+    for (uint8_t page = 0; page < 9; page++)
+    {
+        const uint8_t *sourcePage = source + (page * _width);
+        const uint8_t *shadowPage = shadowBuffer + (page * _width);
+
+        if (memcmp(sourcePage, shadowPage, _width) != 0)
+        {
+            if (page == 0)
+            {
+                dirtyRows[8] = true;
+                dirtyRows[0] = true;
+            }
+            else if (page < 8)
+            {
+                dirtyRows[page - 1] = true;
+                dirtyRows[page] = true;
+            }
+            else
+            {
+                dirtyRows[7] = true;
+            }
+        }
+    }
+
+    if (dirtyRows[8])
+    {
+        sendDisplayRow(source, 8);
+    }
+
+    for (uint8_t row = 0; row < 8; row++)
+    {
+        if (dirtyRows[row])
+        {
+            sendDisplayRow(source, row);
+        }
+    }
+
+    memcpy(shadowBuffer, source, frameSize);
+}
+
+void SAAB_ICM2::flushFull(const uint8_t *source)
+{
+    if (!source)
+    {
+        return;
+    }
+
+    sendDisplayRow(source, 8);
+    for (uint8_t row = 0; row < 8; row++)
+    {
+        sendDisplayRow(source, row);
+    }
+
+    if (shadowBuffer)
+    {
+        const size_t frameSize = _width * ((_height + 7) / 8);
+        memcpy(shadowBuffer, source, frameSize);
+    }
+}
+
 bool SAAB_ICM2::begin(void)
 {
-    // Allocate dat memory
-    if ((!buffer) && !(buffer = (uint8_t *)malloc(_width * ((_height + 7) / 8))))
-        return false;
+    const size_t frameSize = _width * ((_height + 7) / 8);
+    bool allocatedBuffer = false;
+
+    if (!buffer)
+    {
+        buffer = (uint8_t *)malloc(frameSize);
+        if (!buffer)
+            return false;
+        allocatedBuffer = true;
+    }
+
+    if (!shadowBuffer)
+    {
+        shadowBuffer = (uint8_t *)malloc(frameSize);
+        if (!shadowBuffer)
+        {
+            if (allocatedBuffer)
+            {
+                free(buffer);
+                buffer = NULL;
+            }
+            return false;
+        }
+    }
 
     // Zero the framebuffer
     clearDisplay();
+    memset(shadowBuffer, 0xFF, frameSize);
 
     // run all the init commands
     icm2_commandList((const uint8_t[]){0x00, 0x01, 0x10}, 3);
@@ -194,19 +317,36 @@ uint8_t *SAAB_ICM2::getBuffer(void)
 */
 void SAAB_ICM2::clearDisplay(void)
 {
-    memset(buffer, 0, _width * ((_height + 7) / 8));
+    if (buffer)
+    {
+        memset(buffer, 0, _width * ((_height + 7) / 8));
+    }
 }
 
-// REFRESH DISPLAY ---------------------------------------------------------
+void SAAB_ICM2::display(void)
+{
+    flushFull(buffer);
+}
 
-// Write all zeros after an init to clear debris lmao
+void SAAB_ICM2::displayPartial(void)
+{
+    flushIfDirty(buffer);
+}
+
+void SAAB_ICM2::invalidateShadow(void)
+{
+    if (!shadowBuffer)
+    {
+        return;
+    }
+
+    memset(shadowBuffer, 0xFF, _width * ((_height + 7) / 8));
+}
+
 void SAAB_ICM2::forceClear(void)
-{   
-    // Note an extra line is being cleared, this removes the "top 1px line"
-    // In the future this should be line zero
+{
     for (int line = 0; line < 9; line++)
     {
-        // Set address we are writing too, which is split into "lines" of 8 pixels height.
         uint8_t lineAddr = 0x40 + line;
         uint8_t dat[3] = {0x00, 0x01, lineAddr};
         icm2_commandList(dat, sizeof(dat));
@@ -215,133 +355,20 @@ void SAAB_ICM2::forceClear(void)
 
         Wire.beginTransmission(i2caddr);
         Wire.write((uint8_t)0x40);
-        for(int i = 0; i<106; i++)
+        for (int i = 0; i < _width; i++)
         {
             Wire.write(0);
         }
         Wire.endTransmission();
     }
+
+    if (shadowBuffer)
+    {
+        memset(shadowBuffer, 0, _width * ((_height + 7) / 8));
+    }
 }
 
-/*!
-    @brief  Push data currently in RAM to SSD1306 display.
-    @return None (void).
-    @note   Drawing operations are not visible until this function is
-            called. Call after each graphics command, or after a whole set
-            of graphics commands, as best needed by one's own application.
-*/
-void SAAB_ICM2::display(void)
+void SAAB_ICM2::sendBuffer(uint8_t *extBuffer)
 {
-    // The display is split into 9 rows of 8 pixels high, each column represtented by a byte.
-    // What is weird is that the first line pixels (1-pixel high), is actually found in the 9th row as the MSB. 
-    // In this sense, the first line of the display is "at the bottom" of the address space in memory.
-
-    // To prevent weird drawing artifacts, it's best to skip to the 9th row, draw those pixels, and then continue onto rows 1-8.
-    // IE - we physically draw from top to bottom, whilst jumping around in address space.
-    // The frame buffer is setup so that we kind of have to perform bit shifting to get these printed out nicely.
-    // No worries...    
-    
-    // DRAW FIRST PIXEL ROW (top row of pixels).
-    uint8_t *ptr0 = buffer;
-    
-    // Start at row addr 0x48 (9th row in address space)
-    uint8_t lineAddr = 0x40 + 8;
-    uint8_t dat[3] = {0x00, 0x01, lineAddr};
-    
-    icm2_commandList(dat, sizeof(dat));
-    icm2_commandList((const uint8_t[]){0x00, 0x01, 0x20}, 3);
-    icm2_commandList((const uint8_t[]){0x00, 0x01, 0x8d}, 3);
-    
-    uint16_t count = _width;
-
-    Wire.beginTransmission(i2caddr);
-    Wire.write((uint8_t)0x40);
-    
-    while (count--)
-    {
-        Wire.write(*ptr0++ & 0b10000000); // Only grab MSB. This isn't strictly neccesary as only the MSB is actually displayed.
-    }
-    Wire.endTransmission();
-
-    // Draw remaining rows, in groups of 8 pixel columns as mentioned.
-    // Reset pointer to beginning and draw the remaining 8 lines, this sort of "overlaps" the buffer for the first row, in a sense.
-    uint8_t *ptr = buffer;
-
-    for (int line = 0; line < 8; line++)
-    {
-        // Set address location in memory
-        uint8_t lineAddr = 0x40 + line;
-        uint8_t dat[3] = {0x00, 0x01, lineAddr};
-        icm2_commandList(dat, sizeof(dat));
-        icm2_commandList((const uint8_t[]){0x00, 0x01, 0x20}, 3);
-        icm2_commandList((const uint8_t[]){0x00, 0x01, 0x8d}, 3);
-
-        uint16_t count = _width;
-
-        Wire.beginTransmission(i2caddr);
-        Wire.write((uint8_t)0x40);
-
-        while (count--)
-        {
-            Wire.write(((*ptr & 127) << 1) | ((*(ptr + _width) & 0b10000000) >> 7));
-            ptr++;
-        }
-        Wire.endTransmission();
-    }
-}
-
-void SAAB_ICM2::sendBuffer(uint8_t *buffer) {
-    //does NOT work as intended, janky dirty function has issue with bottom pixel row that is known to be strange.
-
-    // The display is split into 9 rows of 8 pixels high, each column represented by a byte.
-    // What is weird is that the first line pixels (1-pixel high), is actually found in the 9th row as the MSB. 
-    // In this sense, the first line of the display is "at the bottom" of the address space in memory.
-
-    // DRAW FIRST PIXEL ROW (top row of pixels).
-    uint8_t *ptr0 = buffer;
-    
-    // Start at row addr 0x48 (9th row in address space)
-    uint8_t lineAddr = 0x40 + 8;
-    uint8_t dat[3] = {0x00, 0x01, lineAddr};
-    
-    icm2_commandList(dat, sizeof(dat));
-    icm2_commandList((const uint8_t[]){0x00, 0x01, 0x20}, 3);
-    icm2_commandList((const uint8_t[]){0x00, 0x01, 0x8d}, 3);
-    
-    uint16_t count = _width;
-
-    Wire.beginTransmission(i2caddr);
-    Wire.write((uint8_t)0x40);
-    
-    while (count--)
-    {
-        Wire.write(*ptr0++ & 0b10000000); // Only grab MSB. This isn't strictly neccesary as only the MSB is actually displayed.
-    }
-    Wire.endTransmission();
-
-    // Draw remaining rows, in groups of 8 pixel columns as mentioned.
-    // Reset pointer to beginning and draw the remaining 8 lines, this sort of "overlaps" the buffer for the first row, in a sense.
-    uint8_t *ptr = buffer;
-
-    for (int line = 0; line < 8; line++)
-    {
-        // Set address location in memory
-        uint8_t lineAddr = 0x40 + line;
-        uint8_t dat[3] = {0x00, 0x01, lineAddr};
-        icm2_commandList(dat, sizeof(dat));
-        icm2_commandList((const uint8_t[]){0x00, 0x01, 0x20}, 3);
-        icm2_commandList((const uint8_t[]){0x00, 0x01, 0x8d}, 3);
-
-        uint16_t count = _width;
-
-        Wire.beginTransmission(i2caddr);
-        Wire.write((uint8_t)0x40);
-
-        while (count--)
-        {
-            Wire.write(((*ptr & 127) << 1) | ((*(ptr + _width) & 0b10000000) >> 7));
-            ptr++;
-        }
-        Wire.endTransmission();
-    }
+    flushFull(extBuffer);
 }

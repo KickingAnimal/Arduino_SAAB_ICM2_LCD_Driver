@@ -21,6 +21,8 @@ public:
 
   boolean begin(void);
   void    display(void);
+  void    displayPartial(void);
+  void    invalidateShadow(void);
   void    clearDisplay(void);
   void    forceClear(void);
   void    drawPixel(int16_t x, int16_t y, uint16_t color);
@@ -34,8 +36,12 @@ public:
 private:
   void icm2_command1(uint8_t c); // Sends a sequence of Wire commands
   void icm2_commandList(const uint8_t *c, uint8_t n); // Sends a sequence of Wire commands
+  void sendDisplayRow(const uint8_t *source, uint8_t row);
+  void flushFull(const uint8_t *source);
+  void flushIfDirty(const uint8_t *source);
 
   uint8_t     *buffer;
+  uint8_t     *shadowBuffer;
   int8_t       i2caddr = 0x3c;
   int8_t       _width = 106;
   int8_t       _height = 65;
